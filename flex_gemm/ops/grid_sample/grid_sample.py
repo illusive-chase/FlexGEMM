@@ -158,7 +158,7 @@ class GridSample3dFunction(Function):
         
         Args:
             feats (torch.Tensor): A [N, C] tensor containing the features to sample from
-            coords (torch.Tensor): A [N, ..., 4] tensor containing the coordinates of the features
+            coords (torch.Tensor): A [N, 4] tensor containing the coordinates of the features
             shape (torch.Size): The spatial shape of the sparse tensor
             grid (torch.Tensor): A [B, L, 3] tensor containing the query points
             mode (str): The interpolation mode to use (nearest, trilinear)
@@ -201,7 +201,7 @@ def grid_sample_3d(
     
     Args:
         feats (torch.Tensor): A [N, C] tensor containing the features to sample from
-        coords (torch.Tensor): A [N, ..., 4] tensor containing the coordinates of the features
+        coords (torch.Tensor): A [N, 4] tensor containing the coordinates of the features
         shape (torch.Size): The spatial shape of the sparse tensor
         grid (torch.Tensor): A [B, L, 3] tensor containing the query points
         mode (str): The interpolation mode to use (nearest, trilinear)
