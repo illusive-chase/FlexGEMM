@@ -30,6 +30,7 @@ def sparse_submanifold_conv_bwd_input_implicit_gemm_splitk_kernel(
     BK: tl.constexpr,   # Block size for K dimension (V * Co)
     SPLITK: tl.constexpr,  # Split K dimension
     allow_tf32: tl.constexpr,  # Allow TF32 precision for matmuls
+    is_uint64: tl.constexpr,  # Whether neighbor is uint64 (True) or uint32 (False)
 ):
     """
     Sparse submanifold convolution backward to input kernel using implicit GEMM.
@@ -55,7 +56,13 @@ def sparse_submanifold_conv_bwd_input_implicit_gemm_splitk_kernel(
     offset_k = tl.arange(0, BK)                                 # (BK,)
     
     # Create a block of the output matrix C.
-    accumulator = tl.zeros((B1, B2), dtype=tl.float32)    
+    accumulator = tl.zeros((B1, B2), dtype=tl.float32)
+    
+    # Use different invalid value markers for uint32 vs uint64
+    if is_uint64:
+        invalid_neighbor = 0xffffffffffffffff
+    else:
+        invalid_neighbor = 0xffffffff
     
     # Iterate along V*Co dimension.
     for k in range(k_start, k_end):
@@ -67,7 +74,7 @@ def sparse_submanifold_conv_bwd_input_implicit_gemm_splitk_kernel(
         # Calculate pointers to weight matrix.
         weight_ptr = weight + (((offset_k[:, None] + bk * BK) * V + v) * Ci + offset_ci[None, :])           # (BK, B2)
         # Load the next block of input and weight.
-        neigh_mask = neighbor_offset_n != 0xffffffff
+        neigh_mask = neighbor_offset_n != invalid_neighbor
         k_mask = offset_k < Co - bk * BK
         grad_output_block = tl.load(grad_output_ptr, mask=neigh_mask[:, None] & k_mask[None, :], other=0.0)
         weight_block = tl.load(weight_ptr, mask=k_mask[:, None], other=0.0)
@@ -110,6 +117,7 @@ def sparse_submanifold_conv_bwd_weight_implicit_gemm_splitk_kernel(
     BCi: tl.constexpr,  # Block size for Ci dimension
     SPLITK: tl.constexpr,  # Split K dimension
     allow_tf32: tl.constexpr,  # Allow TF32 precision for matmuls
+    is_uint64: tl.constexpr,  # Whether neighbor is uint64 (True) or uint32 (False)
 ):
     """
     Sparse submanifold convolution backward to weight kernel using implicit GEMM.
@@ -136,17 +144,23 @@ def sparse_submanifold_conv_bwd_weight_implicit_gemm_splitk_kernel(
     grad_output_ptr = grad_output + k_start * BK * Co + (offset_k[None, :] * Co + offset_co[:, None])   # (B1, BK)
     
     # Create a block of the output matrix C.
-    accumulator = tl.zeros((B1, BV * BCi), dtype=tl.float32)    
+    accumulator = tl.zeros((B1, BV * BCi), dtype=tl.float32)
+    
+    # Use different invalid value markers for uint32 vs uint64
+    if is_uint64:
+        invalid_neighbor = 0xffffffffffffffff
+    else:
+        invalid_neighbor = 0xffffffff
     
     # Iterate along V*Ci dimension.
     for k in range(k_start, k_end):
         mask = offset_k < N - k * BK
         # Calculate pointers to input matrix.
-        input_offset_n = tl.load(neighbor_ptr, mask=mask[:, None], other=0xffffffff)            # (BK, BV)
+        input_offset_n = tl.load(neighbor_ptr, mask=mask[:, None], other=invalid_neighbor)            # (BK, BV)
         input_ptr = input + (input_offset_n[:, :, None].to(tl.int64) * Ci + offset_ci[None, None, :])        # (BK, BV, BCi)
         # Load the next block of input and weight.
         grad_output_block = tl.load(grad_output_ptr, mask=mask[None, :], other=0.0)
-        input_block = tl.load(input_ptr, mask=input_offset_n[:, :, None] != 0xffffffff, other=0.0).reshape(BK, BV * BCi)
+        input_block = tl.load(input_ptr, mask=input_offset_n[:, :, None] != invalid_neighbor, other=0.0).reshape(BK, BV * BCi)
         # Accumulate along the K dimension.
         accumulator = tl.dot(grad_output_block, input_block, accumulator,
                              input_precision='tf32' if allow_tf32 else 'ieee')                  # (B1, B2)
@@ -192,8 +206,11 @@ def sparse_submanifold_conv_bwd_input_implicit_gemm_splitk(
     neighbor: torch.Tensor,
     SPLITK: int = 1,
 ) -> torch.Tensor:
+    assert neighbor.dtype in [torch.uint32, torch.uint64], f"Unsupported neighbor dtype: {neighbor.dtype}. Expected uint32 or uint64"
     N, Ci, Co, V = neighbor.shape[0], weight.shape[-1], weight.shape[0], weight.shape[1]
     LOGN = int(math.log2(N))
+    # Determine if neighbor is uint64
+    is_uint64 = neighbor.dtype == torch.uint64
     # Launch the kernel.
     if SPLITK == 1:
         grad_input = torch.empty((N, Ci), device=weight.device, dtype=weight.dtype)
@@ -205,6 +222,7 @@ def sparse_submanifold_conv_bwd_input_implicit_gemm_splitk(
             grad_input,
             N, LOGN, Ci, Co, V,
             allow_tf32=config.allow_tf32,
+            is_uint64=is_uint64,
         )
         return grad_input
     else:
@@ -218,6 +236,7 @@ def sparse_submanifold_conv_bwd_input_implicit_gemm_splitk(
             N, LOGN, Ci, Co, V,
             SPLITK=SPLITK,
             allow_tf32=config.allow_tf32,
+            is_uint64=is_uint64,
         )
         return grad_input.sum(0).to(weight.dtype)
     
@@ -252,8 +271,11 @@ def sparse_submanifold_conv_bwd_weight_implicit_gemm_splitk(
     neighbor: torch.Tensor,
     SPLITK: int = 1,
 ) -> torch.Tensor:
+    assert neighbor.dtype in [torch.uint32, torch.uint64], f"Unsupported neighbor dtype: {neighbor.dtype}. Expected uint32 or uint64"
     N, Ci, Co, V = neighbor.shape[0], input.shape[1], grad_output.shape[1], neighbor.shape[1]
     LOGN = int(math.log2(N))
+    # Determine if neighbor is uint64
+    is_uint64 = neighbor.dtype == torch.uint64
     # Launch the kernel.
     if SPLITK == 1:
         grad_weight = torch.empty((Co, V, Ci), device=grad_output.device, dtype=grad_output.dtype)
@@ -265,6 +287,7 @@ def sparse_submanifold_conv_bwd_weight_implicit_gemm_splitk(
             grad_weight,
             N, LOGN, Ci, Co, V,
             allow_tf32=config.allow_tf32,
+            is_uint64=is_uint64,
         )
         return grad_weight
     else:
@@ -278,6 +301,7 @@ def sparse_submanifold_conv_bwd_weight_implicit_gemm_splitk(
             N, LOGN, Ci, Co, V,
             SPLITK=SPLITK,
             allow_tf32=config.allow_tf32,
+            is_uint64=is_uint64,
         )
         return grad_weight.sum(0).to(grad_output.dtype)
 
@@ -294,6 +318,7 @@ def sparse_submanifold_conv_bwd_implicit_gemm_splitk(
     assert input.is_contiguous(), "Matrix input must be contiguous"
     assert weight.is_contiguous(), "Matrix weight must be contiguous"
     assert neighbor.is_contiguous(), "Matrix neighbor must be contiguous"
+    assert neighbor.dtype in [torch.uint32, torch.uint64], f"Unsupported neighbor dtype: {neighbor.dtype}. Expected uint32 or uint64"
     N, Ci, Co, V = neighbor.shape[0], input.shape[1], weight.shape[0], weight.shape[1]
     LOGN = int(math.log2(N))
     

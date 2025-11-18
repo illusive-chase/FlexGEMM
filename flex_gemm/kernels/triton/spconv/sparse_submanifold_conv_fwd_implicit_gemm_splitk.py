@@ -27,6 +27,7 @@ def sparse_submanifold_conv_fwd_implicit_gemm_splitk_kernel(
     BK: tl.constexpr,   # Block size for K dimension (V * Ci)
     SPLITK: tl.constexpr,  # Split K dimension
     allow_tf32: tl.constexpr,  # Allow TF32 precision for matmuls
+    is_uint64: tl.constexpr,  # Whether neighbor is uint64 (True) or uint32 (False)
 ):
     """
     Sparse submanifold convolution forward kernel using implicit GEMM with split K dimension.
@@ -55,6 +56,12 @@ def sparse_submanifold_conv_fwd_implicit_gemm_splitk_kernel(
     # Create a block of the output matrix C.
     accumulator = tl.zeros((B1, B2), dtype=tl.float32)
     
+    # Use different invalid value markers for uint32 vs uint64
+    if is_uint64:
+        invalid_neighbor = 0xffffffffffffffff
+    else:
+        invalid_neighbor = 0xffffffff
+    
     # Calculate pointers to weight matrix.
     weight_ptr = weight + k_start * BK + (offset_co[None, :] * V * Ci + offset_k[:, None])     # (BK, B2)
     
@@ -66,7 +73,7 @@ def sparse_submanifold_conv_fwd_implicit_gemm_splitk_kernel(
         neighbor_offset_n = tl.load(neighbor + offset_n * V + v).to(tl.int64)                   # (B1,)
         input_ptr = input + bk * BK + (neighbor_offset_n[:, None].to(tl.int64) * Ci + offset_k[None, :])     # (B1, BK)
         # Load the next block of input and weight.
-        neigh_mask = neighbor_offset_n != 0xffffffff
+        neigh_mask = neighbor_offset_n != invalid_neighbor
         k_mask = offset_k < Ci - bk * BK
         input_block = tl.load(input_ptr, mask=neigh_mask[:, None] & k_mask[None, :], other=0.0)
         weight_block = tl.load(weight_ptr, mask=k_mask[:, None], other=0.0)
@@ -124,8 +131,11 @@ def sparse_submanifold_conv_fwd_implicit_gemm_splitk(
     assert input.is_contiguous(), "Matrix input must be contiguous"
     assert weight.is_contiguous(), "Matrix weight must be contiguous"
     assert neighbor.is_contiguous(), "Matrix neighbor must be contiguous"
+    assert neighbor.dtype in [torch.uint32, torch.uint64], f"Unsupported neighbor dtype: {neighbor.dtype}. Expected uint32 or uint64"
     N, Ci, Co, V = neighbor.shape[0], input.shape[1], weight.shape[0], weight.shape[1]
-    LOGN = int(math.log2(N))    
+    LOGN = int(math.log2(N))
+    # Determine if neighbor is uint64
+    is_uint64 = neighbor.dtype == torch.uint64
     # Launch the kernel.
     if SPLITK == 1:
         output = torch.empty((N, Co), device=input.device, dtype=input.dtype)
@@ -134,6 +144,7 @@ def sparse_submanifold_conv_fwd_implicit_gemm_splitk(
             input, weight, bias, neighbor, output,
             N, LOGN, Ci, Co, V,
             allow_tf32=config.allow_tf32,
+            is_uint64=is_uint64,
         )
         return output
     else:
@@ -144,5 +155,6 @@ def sparse_submanifold_conv_fwd_implicit_gemm_splitk(
             N, LOGN, Ci, Co, V,
             SPLITK=SPLITK,
             allow_tf32=config.allow_tf32,
+            is_uint64=is_uint64,
         )
         return output.sum(dim=0).to(input.dtype)
