@@ -24,6 +24,7 @@ def sparse_submanifold_conv_bwd_input_implicit_gemm_kernel(
     B2: tl.constexpr,   # Block size for Ci dimension
     BK: tl.constexpr,   # Block size for K dimension (V * Co)
     allow_tf32: tl.constexpr,  # Allow TF32 precision for matmuls
+    is_uint64: tl.constexpr,  # Whether neighbor is uint64 (True) or uint32 (False)
 ):
     """
     Sparse submanifold convolution backward to input kernel using implicit GEMM.
@@ -46,7 +47,13 @@ def sparse_submanifold_conv_bwd_input_implicit_gemm_kernel(
     offset_k = tl.arange(0, BK)                                 # (BK,)
     
     # Create a block of the output matrix C.
-    accumulator = tl.zeros((B1, B2), dtype=tl.float32)    
+    accumulator = tl.zeros((B1, B2), dtype=tl.float32)
+    
+    # Use different invalid value markers for uint32 vs uint64
+    if is_uint64:
+        invalid_neighbor = 0xffffffffffffffff
+    else:
+        invalid_neighbor = 0xffffffff
     
     # Iterate along V*Co dimension.
     for k in range(num_k * V):
@@ -58,7 +65,7 @@ def sparse_submanifold_conv_bwd_input_implicit_gemm_kernel(
         # Calculate pointers to weight matrix.
         weight_ptr = weight + (((offset_k[:, None] + bk * BK) * V + v) * Ci + offset_ci[None, :])           # (BK, B2)
         # Load the next block of input and weight.
-        neigh_mask = neighbor_offset_n != 0xffffffff
+        neigh_mask = neighbor_offset_n != invalid_neighbor
         k_mask = offset_k < Co - bk * BK
         grad_output_block = tl.load(grad_output_ptr, mask=neigh_mask[:, None] & k_mask[None, :], other=0.0)
         weight_block = tl.load(weight_ptr, mask=k_mask[:, None], other=0.0)
@@ -101,6 +108,7 @@ def sparse_submanifold_conv_bwd_weight_implicit_gemm_kernel(
     BV: tl.constexpr,   # Block size for V dimension
     BCi: tl.constexpr,  # Block size for Ci dimension
     allow_tf32: tl.constexpr,  # Allow TF32 precision for matmuls
+    is_uint64: tl.constexpr,  # Whether neighbor is uint64 (True) or uint32 (False)
 ):
     """
     Sparse submanifold convolution backward to weight kernel using implicit GEMM.
@@ -127,14 +135,19 @@ def sparse_submanifold_conv_bwd_weight_implicit_gemm_kernel(
     accumulator = tl.zeros((B1, BV * BCi), dtype=tl.float32)   
     
     # Iterate along V*Ci dimension.
+    # Use different invalid value markers for uint32 vs uint64
+    if is_uint64:
+        invalid_neighbor = 0xffffffffffffffff
+    else:
+        invalid_neighbor = 0xffffffff
     for k in range(num_k):
         mask = offset_k < N - k * BK
         # Calculate pointers to input matrix.
-        input_offset_n = tl.load(neighbor_ptr, mask=mask[:, None], other=0xffffffff)            # (BK, BV)
+        input_offset_n = tl.load(neighbor_ptr, mask=mask[:, None], other=invalid_neighbor)            # (BK, BV)
         input_ptr = input + (input_offset_n[:, :, None].to(tl.int64) * Ci + offset_ci[None, None, :])        # (BK, BV, BCi)
         # Load the next block of input and weight.
         grad_output_block = tl.load(grad_output_ptr, mask=mask[None, :], other=0.0)
-        input_block = tl.load(input_ptr, mask=input_offset_n[:, :, None] != 0xffffffff, other=0.0).reshape(BK, BV * BCi)
+        input_block = tl.load(input_ptr, mask=input_offset_n[:, :, None] != invalid_neighbor, other=0.0).reshape(BK, BV * BCi)
         # Accumulate along the K dimension.
         accumulator = tl.dot(grad_output_block, input_block, accumulator,
                              input_precision='tf32' if allow_tf32 else 'ieee')                  # (B1, B2)
@@ -163,8 +176,11 @@ def sparse_submanifold_conv_bwd_implicit_gemm(
     assert input.is_contiguous(), "Matrix input must be contiguous"
     assert weight.is_contiguous(), "Matrix weight must be contiguous"
     assert neighbor.is_contiguous(), "Matrix neighbor must be contiguous"
+    assert neighbor.dtype in [torch.uint32, torch.uint64], f"Unsupported neighbor dtype: {neighbor.dtype}. Expected uint32 or uint64"
     N, Ci, Co, V = neighbor.shape[0], input.shape[1], weight.shape[0], weight.shape[1]
     LOGN = int(math.log2(N))
+    # Determine if neighbor is uint64
+    is_uint64 = neighbor.dtype == torch.uint64
     
     grad_input, grad_weight, grad_bias = None, None, None
     
@@ -181,6 +197,7 @@ def sparse_submanifold_conv_bwd_implicit_gemm(
             grad_input,
             N, LOGN, Ci, Co, V,
             allow_tf32=config.allow_tf32,
+            is_uint64=is_uint64,
         )
         
     # Grad for weight
@@ -196,6 +213,7 @@ def sparse_submanifold_conv_bwd_implicit_gemm(
             grad_weight,
             N, LOGN, Ci, Co, V,
             allow_tf32=config.allow_tf32,
+            is_uint64=is_uint64,
         )
         
     # Grad for bias

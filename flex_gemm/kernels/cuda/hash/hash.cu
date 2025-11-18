@@ -460,11 +460,11 @@ __global__ void hashmap_insert_3d_idx_as_val_cuda_kernel_64(
 ) {
     uint64_t thread_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (thread_id < M) {
-        // coords is [M, 4] int64 tensor, access as flat array
-        int64_t b = coords[thread_id * 4 + 0];
-        int64_t x = coords[thread_id * 4 + 1];
-        int64_t y = coords[thread_id * 4 + 2];
-        int64_t z = coords[thread_id * 4 + 3];
+        int4 coord = reinterpret_cast<const int4*>(coords)[thread_id];
+        int b = coord.x;
+        int x = coord.y;
+        int y = coord.z;
+        int z = coord.w;
         uint64_t key = (((((uint64_t)b * W) + x) * H + y) * D + z);
         linear_probing_insert_64(hashmap, key, thread_id, N);
     }
@@ -475,7 +475,7 @@ __global__ void hashmap_insert_3d_idx_as_val_cuda_kernel_64(
  * Insert 3D coordinates into the hashmap using index as value
  * 
  * @param hashmap   [2N] uint32/uint64 tensor containing the hashmap (key-value pairs)
- * @param coords    [M, 4] int32/int64 tensor containing the keys to be inserted
+ * @param coords    [M, 4] int32 tensor containing the keys to be inserted
  * @param W         the number of width dimensions
  * @param H         the number of height dimensions
  * @param D         the number of depth dimensions
@@ -487,9 +487,8 @@ void hashmap_insert_3d_idx_as_val_cuda(
     int H,
     int D
 ) {
-    // Dispatch to 32-bit or 64-bit kernel based on hashmap dtype
+    // Dispatch to 32-bit or 64-bit kernel
     if (hashmap.dtype() == torch::kUInt32) {
-        TORCH_CHECK(coords.dtype() == torch::kInt32, "When hashmap is uint32, coords must be int32");
         hashmap_insert_3d_idx_as_val_cuda_kernel<<<
             (coords.size(0) + BLOCK_SIZE - 1) / BLOCK_SIZE,
             BLOCK_SIZE
