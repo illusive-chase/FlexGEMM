@@ -2,7 +2,7 @@
 requires = [
     "setuptools>=64",
     "wheel",
-    "torch",
+    # "torch",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -18,8 +18,8 @@ authors = [
     { name = "Jianfeng Xiang", email = "belljig@outlook.com" }
 ]
 dependencies = [
-    "torch>=2.4.0",
-    "triton>=3.2.0; platform_system != 'Windows'",
-    "triton-windows>=3.2.0; platform_system == 'Windows'",
+    # "torch>=2.4.0",
+    # "triton>=3.2.0; platform_system != 'Windows'",
+    # "triton-windows>=3.2.0; platform_system == 'Windows'",
     "filelock",
 ]
